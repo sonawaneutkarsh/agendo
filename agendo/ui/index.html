@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agendo — Deterministic Agent Rollback</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="container stack-lg">
+    <!-- Header -->
+    <header class="header">
+      <div>
+        <h1 class="title">Agendo</h1>
+        <p class="subtitle">
+          Deterministic row-level rollback for autonomous AI agent writes on Postgres 16
+        </p>
+      </div>
+      <button onclick="refreshAll()" class="btn btn-md btn-secondary">
+        Refresh
+      </button>
+    </header>
+
+    <!-- Hardware Notice (shown when demo /bench router is active) -->
+    <div id="hardware-notice" class="notice-amber hidden">
+      <strong>Hardware Desired-State Notice:</strong>
+      Undo restores the database desired-state and re-pushes it to the board (mocked serial push);
+      a database rollback alone does not fix hardware.
+    </div>
+
+    <!-- ESP32 Test-Bench Panel (shown when demo /bench router is active) -->
+    <section id="bench-section" class="card stack-md hidden">
+      <div class="row-between">
+        <h2 class="section-title">ESP32 Test Bench (esp32-bench-01)</h2>
+        <span id="bench-badge" class="badge">Loading...</span>
+      </div>
+      <div id="bench-health" class="grid-3"></div>
+      <div class="grid-2">
+        <div>
+          <h3 class="subhead">Pin Configs</h3>
+          <div id="bench-pins" class="stack-xs font-mono"></div>
+        </div>
+        <div>
+          <h3 class="subhead">Calibration &amp; Mock Serial Push</h3>
+          <div id="bench-cal" class="stack-xs font-mono" style="margin-bottom: 0.75rem;"></div>
+          <div id="bench-push" class="stack-xs font-mono"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Revert Notice / Conflict Banner -->
+    <div id="banner" class="hidden"></div>
+
+    <!-- Action Timeline -->
+    <section class="stack-sm">
+      <div class="row-between">
+        <h2 class="section-title">Agent Action Timeline</h2>
+        <div class="row-gap text-xs text-muted">
+          <span id="pagination-info"></span>
+          <button id="prev-page-btn" onclick="changePage(-1)" class="btn btn-sm btn-secondary" disabled>Prev</button>
+          <button id="next-page-btn" onclick="changePage(1)" class="btn btn-sm btn-secondary" disabled>Next</button>
+        </div>
+      </div>
+      <div id="actions-list" class="stack-sm"></div>
+    </section>
+  </div>
+
+  <script>
+    const PAGE_SIZE = 20;
+    let currentOffset = 0;
+    let totalActions = 0;
+    const expandedActions = new Set();
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    function statusBadge(status) {
+      const map = {
+        applied: "badge-applied",
+        reverted: "badge-reverted",
+        conflict: "badge-conflict",
+        untracked: "badge-untracked",
+      };
+      const cls = map[status] || "badge-applied";
+      return `<span class="badge ${cls}">${escapeHtml(status.toUpperCase())}</span>`;
+    }
+
+    async function fetchBench() {
+      const benchSection = document.getElementById("bench-section");
+      const notice = document.getElementById("hardware-notice");
+      const res = await fetch("/bench");
+      if (res.status === 404) {
+        benchSection.classList.add("hidden");
+        notice.classList.add("hidden");
+        return;
+      }
+      benchSection.classList.remove("hidden");
+      notice.classList.remove("hidden");
+
+      const data = await res.json();
+      const h = data.health;
+
+      const badge = document.getElementById("bench-badge");
+      if (h.overall === "healthy") {
+        badge.className = "badge badge-reverted";
+        badge.textContent = "HEALTHY";
+      } else {
+        badge.className = "badge badge-conflict";
+        badge.textContent = "CORRUPTED";
+      }
+
+      document.getElementById("bench-health").innerHTML = `
+        <div class="${h.i2c_bus === 'online' ? 'pill-ok' : 'pill-bad'}">
+          I2C Bus: <strong>${h.i2c_bus.toUpperCase()}</strong>
+        </div>
+        <div class="${h.gpio12_adc === 'ok' ? 'pill-ok' : 'pill-bad'}">
+          GPIO12 ADC: <strong>${h.gpio12_adc.toUpperCase()}</strong>
+        </div>
+        <div class="${h.calibration === 'ok' ? 'pill-ok' : 'pill-bad'}">
+          Calibration: <strong>${h.calibration.toUpperCase()}</strong>
+        </div>
+      `;
+
+      document.getElementById("bench-pins").innerHTML = data.pins.map(p => `
+        <div class="item-row">
+          <span>GPIO${p.gpio_pin} (${escapeHtml(p.mode)})</span>
+          <span class="text-muted">${p.voltage_mv}mV | pull_up=${p.pull_up}</span>
+        </div>
+      `).join("");
+
+      document.getElementById("bench-cal").innerHTML = data.calibration.length
+        ? data.calibration.map(c => `
+            <div class="item-row">
+              <span>${escapeHtml(c.sensor)}</span>
+              <span class="text-muted">${c.offset_mv} mV</span>
+            </div>
+          `).join("")
+        : `<div class="pill-bad text-xs">Calibration rows missing!</div>`;
+
+      document.getElementById("bench-push").innerHTML = data.hardware_push_log.length
+        ? data.hardware_push_log.slice(0, 1).map(p =>
+            `<div class="push-log">Last serial push: ${escapeHtml(p.board_id)} (${p.pins_pushed.length} pins synced @ ${escapeHtml(p.pushed_at)})</div>`
+          ).join("")
+        : `<div class="text-dim text-xs">No serial re-push recorded yet.</div>`;
+    }
+
+    async function fetchActions() {
+      const res = await fetch(`/actions?limit=${PAGE_SIZE}&offset=${currentOffset}`);
+      totalActions = Number(res.headers.get("X-Total-Count") || "0");
+      const actions = await res.json();
+
+      const info = document.getElementById("pagination-info");
+      const prevBtn = document.getElementById("prev-page-btn");
+      const nextBtn = document.getElementById("next-page-btn");
+      if (totalActions > 0) {
+        const start = currentOffset + 1;
+        const end = Math.min(currentOffset + actions.length, totalActions);
+        info.textContent = `${start}-${end} of ${totalActions}`;
+      } else {
+        info.textContent = "0 actions";
+      }
+      prevBtn.disabled = currentOffset === 0;
+      nextBtn.disabled = currentOffset + actions.length >= totalActions;
+
+      const container = document.getElementById("actions-list");
+      if (!actions.length) {
+        container.innerHTML = `<div class="card text-muted text-sm" style="text-align:center;">No actions recorded yet. Run the demo script or an agent write.</div>`;
+        return;
+      }
+
+      container.innerHTML = actions.map(a => {
+        const isUntracked = a.action_id === "untracked";
+        const isExpanded = expandedActions.has(a.action_id);
+
+        return `
+          <div class="action-card ${isUntracked ? 'action-card-untracked' : ''} stack-sm">
+            <div class="row-between">
+              <div class="stack-xs">
+                <div class="row-gap">
+                  ${statusBadge(a.status)}
+                  <strong style="color:#fff;">${escapeHtml(a.agent_name)}</strong>
+                  <span class="text-xs text-muted font-mono">${escapeHtml(a.action_id)}</span>
+                </div>
+                <p class="text-sm ${isUntracked ? 'text-amber' : ''}" style="margin:0; color:${isUntracked ? '#fcd34d' : '#cbd5e1'};">
+                  ${escapeHtml(a.description || "(no description)")}
+                </p>
+                <p class="text-xs text-dim" style="margin:0;">
+                  ${a.row_count} row diff(s) &middot; ${escapeHtml(a.created_at || "")}
+                </p>
+              </div>
+              <div class="row-gap">
+                <button
+                  onclick="toggleDiff('${escapeHtml(a.action_id)}')"
+                  class="btn btn-sm btn-secondary"
+                >
+                  ${isExpanded ? "Hide Diff" : "Inspect Diff"}
+                </button>
+                ${!isUntracked ? `
+                  <button
+                    onclick="undoAction('${escapeHtml(a.action_id)}')"
+                    ${a.status === 'reverted' ? 'disabled' : ''}
+                    class="btn btn-sm ${a.status === 'reverted' ? 'btn-disabled' : 'btn-danger'}"
+                  >
+                    ${a.status === 'reverted' ? 'Reverted' : 'Revert'}
+                  </button>
+                ` : ''}
+              </div>
+            </div>
+            <div id="diff-${escapeHtml(a.action_id)}" class="${isExpanded ? '' : 'hidden'} diff-wrap stack-xs"></div>
+          </div>
+        `;
+      }).join("");
+
+      for (const id of expandedActions) {
+        loadDiff(id);
+      }
+    }
+
+    async function changePage(delta) {
+      currentOffset = Math.max(0, currentOffset + delta * PAGE_SIZE);
+      await fetchActions();
+    }
+
+    async function toggleDiff(actionId) {
+      if (expandedActions.has(actionId)) {
+        expandedActions.delete(actionId);
+        document.getElementById(`diff-${actionId}`).classList.add("hidden");
+      } else {
+        expandedActions.add(actionId);
+        const el = document.getElementById(`diff-${actionId}`);
+        el.classList.remove("hidden");
+        await loadDiff(actionId);
+      }
+    }
+
+    async function loadDiff(actionId) {
+      const el = document.getElementById(`diff-${actionId}`);
+      if (!el) return;
+      const res = await fetch(`/actions/${actionId}`);
+      if (!res.ok) return;
+      const detail = await res.json();
+      el.innerHTML = detail.diffs.map(d => `
+        <div class="diff-box font-mono stack-xs">
+          <div class="row-between text-muted">
+            <span><strong>${escapeHtml(d.op)}</strong> on <span style="color:#e2e8f0;">${escapeHtml(d.table_name)}</span></span>
+            <span>pk=${escapeHtml(JSON.stringify(d.pk))} &middot; seq=${d.seq}</span>
+          </div>
+          <div class="grid-2">
+            <div class="diff-old">
+              <div class="diff-old-label">- OLD</div>
+              <pre class="pre-wrap">${escapeHtml(JSON.stringify(d.old_row, null, 2))}</pre>
+            </div>
+            <div class="diff-new">
+              <div class="diff-new-label">+ NEW</div>
+              <pre class="pre-wrap">${escapeHtml(JSON.stringify(d.new_row, null, 2))}</pre>
+            </div>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    async function undoAction(actionId) {
+      const banner = document.getElementById("banner");
+      const res = await fetch(`/actions/${actionId}/undo`, { method: "POST" });
+      const data = await res.json();
+
+      banner.classList.remove("hidden");
+      if (res.status === 409) {
+        banner.className = "banner-conflict stack-xs";
+        banner.innerHTML = `
+          <div><strong>409 Conflict — Restore aborted to protect newer writes!</strong> (${escapeHtml(data.reason || "")})</div>
+          <pre class="pre-wrap font-mono text-xs" style="background:#020617;padding:0.75rem;border-radius:0.25rem;border:1px solid rgba(244,63,94,0.3);overflow-x:auto;">${escapeHtml(JSON.stringify(data.three_way_diff, null, 2))}</pre>
+        `;
+      } else {
+        banner.className = "banner-ok stack-xs";
+        banner.innerHTML = `
+          <div><strong>Action ${escapeHtml(data.status.toUpperCase())} in ${data.elapsed_ms} ms</strong></div>
+          <pre class="pre-wrap font-mono text-xs">${escapeHtml(data.revert_notice || "")}</pre>
+        `;
+      }
+      await refreshAll();
+    }
+
+    async function refreshAll() {
+      await Promise.all([fetchBench(), fetchActions()]);
+    }
+
+    refreshAll();
+  </script>
+</body>
+</html>

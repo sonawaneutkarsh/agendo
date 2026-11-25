@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agendo-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agendo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env or environment}
+      POSTGRES_DB: ${POSTGRES_DB:-agendo}
+    ports:
+      - "5432:5432"
+    volumes:
+      - agendo_pgdata:/var/lib/postgresql/data
+      - ./sql/01_agendo.sql:/docker-entrypoint-initdb.d/01_agendo.sql:ro
+      - ./demo/seed.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-agendo} -d $${POSTGRES_DB:-agendo}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  agendo_pgdata:

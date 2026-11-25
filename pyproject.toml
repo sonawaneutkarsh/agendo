@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25.0,<2.0.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agendo"
+version = "0.1.0"
+description = "Deterministic row-level rollback engine for AI agents on Postgres"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Utkarsh" },
+]
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "psycopg[binary]>=3.2.0,<4.0.0",
+    "fastapi>=0.115.0,<1.0.0",
+    "uvicorn>=0.32.0,<1.0.0",
+    "google-genai>=1.0.0,<4.0.0",
+    "sqlparse>=0.5.0,<0.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0,<10.0.0",
+    "httpx>=0.27.0,<1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/sonawaneutkarsh/agendo"
+Repository = "https://github.com/sonawaneutkarsh/agendo"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agendo"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
