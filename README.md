@@ -50,13 +50,16 @@ SELECT attach_agendo_trigger('your_table_name');
 
 2. Open [http://localhost:8000](http://localhost:8000) to see the healthy ESP32 test bench (`esp32-bench-01`).
 
-3. Run the ESP32 brownout-diagnosis agent:
+3. Run the self-contained ESP32 demo loop (corrupts `GPIO12`, disables I2C pull-ups, wipes 2 calibration rows → runs diagnose + repair → auto-reverts → feeds `REVERT NOTICE` back and verifies skip):
    ```bash
-   # Deterministic offline demo:
+   # Deterministic offline full loop:
    python -m demo.run_demo
 
-   # Live Gemini Flash + Gemini 4 Hydrogen tool-calling (requires GEMINI_API_KEY):
+   # Live Gemini full loop using v1beta function calling (requires GEMINI_API_KEY):
    python -m demo.run_demo --live-gemini
+
+   # Pause after repair without auto-reverting (to click Revert in the UI):
+   python -m demo.run_demo --no-revert
    ```
 
 4. Refresh [http://localhost:8000](http://localhost:8000), inspect the red/green JSON diff, and click **Revert** (or see [demo/script.md](demo/script.md)).

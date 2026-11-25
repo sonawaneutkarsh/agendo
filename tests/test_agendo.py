@@ -396,14 +396,21 @@ def test_core_vs_demo_separation_and_persisted_hardware_pushes():
 
 
 def test_agent_live_fails_without_key_executes_model_sql_and_respects_revert_notice(monkeypatch):
-    """Proves: (1) live mode fails fast without GEMINI_API_KEY, (2) model-produced SQL is executed
-    (not canned SQL) and fails loudly if missing, (3) revert notice stops re-applying bad writes.
+    """Proves: (1) live mode fails fast without GEMINI_API_KEY, (2) client uses v1beta,
+    (3) model-produced SQL is executed (not canned SQL) and fails loudly if missing,
+    (4) revert notice stops re-applying bad writes.
     """
+    from agendo.agent import _get_genai_client
+
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="GEMINI_API_KEY is not set"):
         run_diagnosis_and_repair(use_live_gemini=True)
 
-    # Fake google-genai client simulating Flash + Hydrogen tool calling
+    monkeypatch.setenv("GEMINI_API_KEY", "test-only-dummy-key")
+    configured_client = _get_genai_client()
+    assert configured_client._api_client._http_options.api_version == "v1beta"
+
+    # Fake google-genai client simulating Flash diagnosis (config=None) + tool-calling step
     class FakeModels:
         def __init__(self, mode: str) -> None:
             self.mode = mode
@@ -411,11 +418,11 @@ def test_agent_live_fails_without_key_executes_model_sql_and_respects_revert_not
 
         def generate_content(self, model: str, contents: str, config=None):
             self.calls.append(model)
-            if "flash" in model:
+            if config is None:
                 return SimpleNamespace(text="Flash saw GPIO12 at 1800mV.")
             if self.mode == "no_tool_call":
                 return SimpleNamespace(text="I think you should inspect GPIO12.", function_calls=[])
-            if "REVERT NOTICE" in contents:
+            if "REVERT NOTICE:" in contents:
                 return SimpleNamespace(
                     text="",
                     function_calls=[
@@ -490,3 +497,41 @@ def test_attach_agendo_trigger_on_custom_table():
         assert table_row_hash("custom_orders", "order_id", conn) != before
         restore_action(res["action_id"], conn=conn)
         assert table_row_hash("custom_orders", "order_id", conn) == before
+
+
+def test_self_contained_demo_corrupt_repair_revert_skip_loop():
+    """Proves demo.run_demo.corrupt_board() corrupts GPIO12, I2C pull-ups, and calibration,
+    then the agent repairs it, restore_action reverts it, and feeding revert_notice skips re-do.
+    """
+    from demo.run_demo import corrupt_board
+
+    corrupt_res = corrupt_board()
+    assert corrupt_res["diffs_captured"] == 5
+
+    with get_connection() as conn:
+        gpio12 = conn.execute(
+            "SELECT mode, voltage_mv FROM pin_configs WHERE board_id = 'esp32-bench-01' AND gpio_pin = 12"
+        ).fetchone()
+        pullups = conn.execute(
+            "SELECT COUNT(*)::int AS cnt FROM pin_configs WHERE board_id = 'esp32-bench-01' AND gpio_pin IN (4, 5) AND pull_up"
+        ).fetchone()
+        cal_count = conn.execute(
+            "SELECT COUNT(*)::int AS cnt FROM calibration WHERE board_id = 'esp32-bench-01'"
+        ).fetchone()
+        assert gpio12 == {"mode": "OUTPUT_HIGH", "voltage_mv": 3300}
+        assert pullups["cnt"] == 0
+        assert cal_count["cnt"] == 0
+
+    repair_outcome = run_diagnosis_and_repair(use_live_gemini=False)
+    assert repair_outcome["skipped"] is False
+    assert repair_outcome["action"] is not None
+
+    revert_res = restore_action(repair_outcome["action"]["action_id"])
+    assert revert_res["status"] == "reverted"
+
+    followup = run_diagnosis_and_repair(
+        use_live_gemini=False,
+        revert_notice=revert_res["revert_notice"],
+    )
+    assert followup["skipped"] is True
+    assert followup["action"] is None

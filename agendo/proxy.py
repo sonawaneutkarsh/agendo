@@ -23,7 +23,6 @@ FORBIDDEN_KEYWORDS: frozenset[str] = frozenset(
         "REPLACE",
         "GRANT",
         "REVOKE",
-        "DO",
         "CALL",
         "EXECUTE",
         "VACUUM",
@@ -97,6 +96,15 @@ def check_permissions(sql_text: str, extra_denied_tables: Sequence[str] = ()) ->
             raise PermissionDeniedError(
                 f"Permission denied: statement type '{stmt_type}' is blocked "
                 "because row-level undo cannot revert schema or privilege changes."
+            )
+
+        # Block top-level anonymous DO $$ ... $$ procedural blocks while still
+        # allowing valid PostgreSQL upserts (`INSERT ... ON CONFLICT DO UPDATE/NOTHING`).
+        first_tok = stmt.token_first(skip_ws=True, skip_cm=True)
+        if first_tok is not None and first_tok.value.upper() == "DO":
+            raise PermissionDeniedError(
+                "Permission denied: SQL keyword 'DO' is blocked "
+                "because row-level undo cannot revert DDL or procedural blocks."
             )
 
         # Walk flattened tokens, skipping string literals and comments so values like
