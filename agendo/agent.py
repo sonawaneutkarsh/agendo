@@ -15,6 +15,15 @@ logger = logging.getLogger("agendo.agent")
 FLASH_MODEL = os.environ.get("GEMINI_FLASH_MODEL", "gemini-3.8-flash")
 REASONING_MODEL = os.environ.get("GEMINI_REASONING_MODEL", "gemini-4-hydrogen")
 
+EXPECTED_HEALTHY_BASELINE = """Expected-healthy baseline for esp32-bench-01:
+- GPIO4 (pin_configs): mode='I2C_SDA', voltage_mv=3300, pull_up=true
+- GPIO5 (pin_configs): mode='I2C_SCL', voltage_mv=3300, pull_up=true
+- GPIO12 (pin_configs): mode='ADC_IN', voltage_mv=1800, pull_up=false
+- GPIO13 (pin_configs): mode='STATUS_LED', voltage_mv=3300, pull_up=false
+- calibration: rows for BOTH sensors MUST exist:
+  - sensor='temp_ntc', offset_mv=8 (+8mV)
+  - sensor='vbat_adc', offset_mv=-12 (-12mV)"""
+
 
 def _read_bench_snapshot() -> dict[str, Any]:
     with get_connection() as conn:
@@ -37,11 +46,10 @@ def _is_bench_corrupted(state: dict[str, Any]) -> bool:
         p["gpio_pin"] == 12 and (p["mode"] != "ADC_IN" or p["voltage_mv"] != 1800)
         for p in pins
     )
-    i2c_bad = (
-        sum(1 for p in pins if p["gpio_pin"] in (4, 5) and p["pull_up"]) < 2
-    )
-    cal_missing = len(calibration) < 2
-    return gpio12_bad or i2c_bad or cal_missing
+    i2c_bad = sum(1 for p in pins if p["gpio_pin"] in (4, 5) and p["pull_up"]) < 2
+    cal_by_sensor = {c["sensor"]: c["offset_mv"] for c in calibration}
+    cal_bad = cal_by_sensor.get("temp_ntc") != 8 or cal_by_sensor.get("vbat_adc") != -12
+    return gpio12_bad or i2c_bad or cal_bad
 
 
 def _build_repair_tools():
@@ -89,15 +97,15 @@ def _build_repair_tools():
     skip_repair = types.FunctionDeclaration(
         name="skip_repair",
         description=(
-            "Abort or skip making any database writes when the bench is already healthy "
-            "or when a REVERT NOTICE indicates the previous repair was rejected."
+            "Return an explicit SKIP verdict without modifying the database — required when "
+            "a human reviewed and reverted the previous repair or when the bench matches baseline."
         ),
         parameters_json_schema={
             "type": "object",
             "properties": {
                 "reason": {
                     "type": "string",
-                    "description": "Explanation of why no database writes should be performed.",
+                    "description": "Explicit SKIP verdict explaining why no database writes are made.",
                 }
             },
             "required": ["reason"],
@@ -129,7 +137,7 @@ def run_diagnosis_and_repair(
       test `genai_client` is injected), requires valid tool calls from the model, and
       never falls back to hardcoded SQL or Flash on error.
     - When `use_live_gemini=False`: runs deterministic offline mode; respects
-      `revert_notice` by refusing to re-apply previously reverted writes.
+      `revert_notice` by returning an explicit SKIP verdict.
     """
     state = _read_bench_snapshot()
     notice_block = f"\n\n{revert_notice}\n" if revert_notice else ""
@@ -142,42 +150,75 @@ def run_diagnosis_and_repair(
 
         client = genai_client or _get_genai_client()
 
-        diag_prompt = (
-            "You are an embedded systems diagnostic loop (Gemini Flash). "
-            f"Inspect this ESP32 bench state for board '{board_id}' and summarize any "
-            "brownout, voltage, GPIO12 mode, I2C pull-up, or calibration anomalies concisely.\n"
-            f"Bench state:\n{json.dumps(state, default=str)}{notice_block}"
+        diag_system_instruction = (
+            "You are an embedded systems diagnostic loop (Gemini Flash).\n"
+            f"{EXPECTED_HEALTHY_BASELINE}\n\n"
+            "Instructions:\n"
+            "1. Compare the live bench state strictly against the expected-healthy baseline above.\n"
+            "2. List EVERY single deviation (wrong pin mode, wrong voltage_mv, disabled pull_up, "
+            "and missing or wrong calibration rows for temp_ntc / vbat_adc) before any repair is planned.\n"
+            "3. Never treat a deviation from the baseline (such as GPIO12 OUTPUT_HIGH or missing calibration rows) as valid."
         )
+        if revert_notice:
+            diag_prompt = (
+                f"A human deliberately reviewed and reverted the repair for board '{board_id}'.\n"
+                "Summarize the current state and note that a human revert override is active — "
+                "do NOT recommend re-applying the reverted writes.\n"
+                f"Bench state:\n{json.dumps(state, default=str)}{notice_block}"
+            )
+        else:
+            diag_prompt = (
+                f"Compare the live ESP32 bench state for board '{board_id}' against the expected-healthy "
+                "baseline and list every deviation concisely:\n"
+                f"Bench state:\n{json.dumps(state, default=str)}"
+            )
+
         flash_resp = client.models.generate_content(
             model=flash_model,
             contents=diag_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=diag_system_instruction,
+            ),
         )
         flash_summary = (flash_resp.text or "").strip()
 
         repair_tool = _build_repair_tools()
         system_instruction = (
             "You are a hardware-bench SQL repair agent operating behind Agendo on PostgreSQL 16.\n"
+            f"{EXPECTED_HEALTHY_BASELINE}\n\n"
             "Tables:\n"
             "- esp32_devices (board_id TEXT PK, name TEXT, firmware_status TEXT)\n"
             "- pin_configs (board_id TEXT, gpio_pin INT, mode TEXT, voltage_mv INT, pull_up BOOLEAN, PK (board_id, gpio_pin))\n"
             "- calibration (board_id TEXT, sensor TEXT, offset_mv INT, PK (board_id, sensor))\n"
             "- diag_logs (id SERIAL PK, board_id TEXT, message TEXT, created_at TIMESTAMPTZ)\n\n"
-            "Rules for `apply_sql_repair`:\n"
+            "Rules:\n"
             "- Emit valid PostgreSQL DML ONLY (UPDATE / INSERT / DELETE), never DDL (DROP/ALTER/TRUNCATE/CREATE).\n"
             "- Use `%s` positional placeholders ONLY (never `$1` or `?`) with matching `params` arrays.\n"
-            "- When the bench has anomalies (e.g. GPIO12 is OUTPUT_HIGH/3300mV instead of ADC_IN/1800mV, "
-            "I2C GPIO4/GPIO5 pull_up=false, or missing calibration) AND no REVERT NOTICE is present, "
-            "you MUST call `apply_sql_repair` to fix the database state.\n"
-            "- CRITICAL RULE: When a REVERT NOTICE is present in the prompt, a human or test just reverted "
-            "your previous action. You MUST NOT re-apply those mutations; call `skip_repair` instead."
+            "- When NO human revert override is present, fix EVERY deviation from the expected-healthy "
+            "baseline in one `apply_sql_repair` call (restore GPIO12 ADC_IN @ 1800mV, enable GPIO4/GPIO5 pull_up=true, "
+            "restore temp_ntc=+8mV and vbat_adc=-12mV calibration rows via INSERT ... ON CONFLICT DO UPDATE, "
+            "and insert a diag_logs entry).\n"
+            "- MANDATORY HUMAN OVERRIDE RULE: If the prompt states that a human deliberately reviewed and "
+            "reverted the repair, do NOT re-apply the reverted writes; reply with an explicit SKIP verdict "
+            "by calling `skip_repair`."
         )
-        plan_prompt = (
-            f"Flash diagnostic summary:\n{flash_summary}\n\n"
-            f"Current database state:\n{json.dumps(state, default=str)}"
-            f"{notice_block}\n\n"
-            "Call `apply_sql_repair` with valid PostgreSQL parameterized SQL (%s placeholders) if a repair "
-            "is needed, or call `skip_repair` if a revert notice above instructs not to repeat the action."
-        )
+
+        if revert_notice:
+            plan_prompt = (
+                "HUMAN REVIEW OVERRIDE:\n"
+                "A human deliberately reviewed and reverted the repair; do NOT re-apply the reverted writes; "
+                "reply with an explicit SKIP verdict by calling `skip_repair`.\n\n"
+                f"Flash diagnostic summary:\n{flash_summary}\n\n"
+                f"Current database state:\n{json.dumps(state, default=str)}"
+                f"{notice_block}"
+            )
+        else:
+            plan_prompt = (
+                f"Flash diagnostic summary (list of deviations):\n{flash_summary}\n\n"
+                f"Current database state:\n{json.dumps(state, default=str)}\n\n"
+                "Call `apply_sql_repair` with parameterized PostgreSQL SQL (%s placeholders) fixing EVERY "
+                "deviation from the expected-healthy baseline."
+            )
 
         try:
             plan_resp = client.models.generate_content(
@@ -216,10 +257,10 @@ def run_diagnosis_and_repair(
         args = dict(getattr(call, "args", {}) or {})
 
         if call_name == "skip_repair":
-            reason = str(args.get("reason") or "Model chose to skip repair.")
+            reason = str(args.get("reason") or "SKIP: human reverted prior repair.")
             return {
                 "flash_summary": flash_summary,
-                "reasoning_plan": f"SKIPPED: {reason}",
+                "reasoning_plan": f"SKIP: {reason}",
                 "skipped": True,
                 "skip_reason": reason,
                 "action": None,
@@ -259,11 +300,11 @@ def run_diagnosis_and_repair(
     # Explicit offline demo mode (`use_live_gemini=False`)
     if revert_notice:
         skip_reason = (
-            "Offline agent received REVERT NOTICE and refused to re-apply the reverted writes."
+            "SKIP: human deliberately reviewed and reverted the repair; not re-applying reverted writes."
         )
         return {
-            "flash_summary": "Diagnostic loop paused after revert notice.",
-            "reasoning_plan": f"SKIPPED: {skip_reason}",
+            "flash_summary": "Diagnostic loop paused after human revert review.",
+            "reasoning_plan": skip_reason,
             "skipped": True,
             "skip_reason": skip_reason,
             "action": None,
@@ -271,13 +312,13 @@ def run_diagnosis_and_repair(
 
     if _is_bench_corrupted(state):
         flash_summary = (
-            "Flash loop detected fault: GPIO12=OUTPUT_HIGH @ 3300mV (expected ADC_IN 1800mV), "
-            "GPIO4/GPIO5 I2C pull-ups disabled, and calibration rows missing."
+            "Deviations from baseline: (1) GPIO12 is OUTPUT_HIGH @ 3300mV instead of ADC_IN @ 1800mV; "
+            "(2) GPIO4/GPIO5 pull_up=false instead of true; (3) calibration rows temp_ntc (+8mV) and vbat_adc (-12mV) missing."
         )
         reasoning_plan = (
             "1. Restore GPIO12 to ADC_IN @ 1800mV.\n"
             "2. Re-enable pull-ups on GPIO4/GPIO5 for I2C.\n"
-            "3. Restore baseline calibration offsets and log repair."
+            "3. Restore calibration rows temp_ntc (+8mV) and vbat_adc (-12mV) and log repair."
         )
         statements = [
             (

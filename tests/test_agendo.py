@@ -410,16 +410,21 @@ def test_agent_live_fails_without_key_executes_model_sql_and_respects_revert_not
     configured_client = _get_genai_client()
     assert configured_client._api_client._http_options.api_version == "v1beta"
 
-    # Fake google-genai client simulating Flash diagnosis (config=None) + tool-calling step
+    # Fake google-genai client simulating Flash diagnosis (no tools) + tool-calling step
     class FakeModels:
         def __init__(self, mode: str) -> None:
             self.mode = mode
             self.calls: list[str] = []
+            self.diag_system_instructions: list[str] = []
+            self.plan_prompts: list[str] = []
 
         def generate_content(self, model: str, contents: str, config=None):
             self.calls.append(model)
-            if config is None:
-                return SimpleNamespace(text="Flash saw GPIO12 at 1800mV.")
+            if config is None or not getattr(config, "tools", None):
+                sys_inst = getattr(config, "system_instruction", "") or ""
+                self.diag_system_instructions.append(sys_inst)
+                return SimpleNamespace(text="Flash saw GPIO12 at OUTPUT_HIGH 3300mV and missing calibration.")
+            self.plan_prompts.append(contents)
             if self.mode == "no_tool_call":
                 return SimpleNamespace(text="I think you should inspect GPIO12.", function_calls=[])
             if "REVERT NOTICE:" in contents:
@@ -428,7 +433,7 @@ def test_agent_live_fails_without_key_executes_model_sql_and_respects_revert_not
                     function_calls=[
                         SimpleNamespace(
                             name="skip_repair",
-                            args={"reason": "Previous repair was reverted; skipping DB mutations."},
+                            args={"reason": "SKIP: human reviewed and reverted prior repair."},
                         )
                     ],
                 )
@@ -457,12 +462,18 @@ def test_agent_live_fails_without_key_executes_model_sql_and_respects_revert_not
             genai_client=SimpleNamespace(models=FakeModels("no_tool_call")),
         )
 
-    # 2. Execute model-produced SQL (NOT canned GPIO12/calibration SQL), revert, then re-run w/ notice
-    fake_client = SimpleNamespace(models=FakeModels("normal"))
+    # 2. Verify baseline in diag system prompt, model SQL execution, and explicit SKIP on revert notice
+    fake_models = FakeModels("normal")
+    fake_client = SimpleNamespace(models=fake_models)
     outcome = run_diagnosis_and_repair(use_live_gemini=True, genai_client=fake_client)
     assert outcome["skipped"] is False
     assert outcome["action"]["diffs_captured"] == 1
     assert "Model-generated diagnostic entry" in str(outcome["statements_executed_by_model"])
+    diag_sys = fake_models.diag_system_instructions[0]
+    assert "ADC_IN" in diag_sys and "1800" in diag_sys
+    assert "pull_up=true" in diag_sys
+    assert "temp_ntc" in diag_sys and "+8mV" in diag_sys
+    assert "vbat_adc" in diag_sys and "-12mV" in diag_sys
 
     revert_res = restore_action(outcome["action"]["action_id"])
     assert revert_res["status"] == "reverted"
@@ -474,6 +485,8 @@ def test_agent_live_fails_without_key_executes_model_sql_and_respects_revert_not
     )
     assert followup["skipped"] is True
     assert followup["action"] is None
+    assert "deliberately reviewed and reverted" in fake_models.plan_prompts[-1]
+    assert "explicit SKIP verdict" in fake_models.plan_prompts[-1]
 
 
 def test_attach_agendo_trigger_on_custom_table():
@@ -535,3 +548,37 @@ def test_self_contained_demo_corrupt_repair_revert_skip_loop():
     )
     assert followup["skipped"] is True
     assert followup["action"] is None
+
+
+def test_step3_followup_diff_check_detects_reapplied_writes_only():
+    """Step-3 diff guard passes on explicit SKIP or non-overlapping note, and fails loudly
+    with RuntimeError if the follow-up re-applies any reverted diff.
+    """
+    from demo.run_demo import assert_followup_does_not_reapply, corrupt_board
+
+    corrupt_board()
+    repair = run_diagnosis_and_repair(use_live_gemini=False)
+    reverted_id = repair["action"]["action_id"]
+    restore_action(reverted_id)
+
+    # 1. Explicit SKIP passes
+    assert_followup_does_not_reapply(reverted_id, {"skipped": True, "action": None})
+
+    # 2. Non-reapplying diag_logs note passes
+    note_action = execute_write(
+        sql="INSERT INTO diag_logs (board_id, message) VALUES (%s, %s)",
+        params=("esp32-bench-01", "Human review acknowledged; skipping repair."),
+        agent_name="ack-agent",
+        description="Acknowledgment log",
+    )
+    assert_followup_does_not_reapply(reverted_id, {"skipped": False, "action": note_action})
+
+    # 3. Re-applying a reverted pin_configs mutation fails loudly
+    reapply_action = execute_write(
+        sql="UPDATE pin_configs SET mode = %s, voltage_mv = %s WHERE board_id = %s AND gpio_pin = %s",
+        params=("ADC_IN", 1800, "esp32-bench-01", 12),
+        agent_name="stubborn-agent",
+        description="Re-apply reverted GPIO12 repair",
+    )
+    with pytest.raises(RuntimeError, match="re-applied a reverted statement"):
+        assert_followup_does_not_reapply(reverted_id, {"skipped": False, "action": reapply_action})

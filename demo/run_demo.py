@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 from agendo.agent import run_diagnosis_and_repair
+from agendo.capture import get_action_detail
 from agendo.db import get_connection
 from agendo.proxy import execute_write
 from agendo.restore import register_post_restore_hook, restore_action
@@ -68,6 +69,48 @@ def corrupt_board(board_id: str = "esp32-bench-01") -> dict[str, Any]:
     )
 
 
+def _strip_auto_fields(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {k: v for k, v in row.items() if k not in ("id", "created_at")}
+
+
+def assert_followup_does_not_reapply(
+    reverted_action_id: str, followup: dict[str, Any]
+) -> None:
+    """Fail loudly ONLY if the follow-up proposes/executes SQL that re-applies any reverted diff."""
+    if followup.get("skipped") and followup.get("action") is None:
+        return
+
+    followup_action = followup.get("action")
+    if not followup_action:
+        return
+
+    reverted_detail = get_action_detail(reverted_action_id)
+    followup_detail = get_action_detail(followup_action["action_id"])
+    reverted_diffs = (reverted_detail or {}).get("diffs") or []
+    followup_diffs = (followup_detail or {}).get("diffs") or []
+
+    for fd in followup_diffs:
+        for rd in reverted_diffs:
+            same_target_and_op = (
+                fd["table_name"] == rd["table_name"]
+                and fd["pk"] == rd["pk"]
+                and fd["op"] == rd["op"]
+            )
+            same_row_payload = (
+                fd["table_name"] == rd["table_name"]
+                and fd["op"] == rd["op"]
+                and fd["new_row"] is not None
+                and _strip_auto_fields(fd["new_row"]) == _strip_auto_fields(rd["new_row"])
+            )
+            if same_target_and_op or same_row_payload:
+                raise RuntimeError(
+                    "Agent re-applied a reverted statement after REVERT NOTICE: "
+                    f"table={fd['table_name']} pk={fd['pk']} op={fd['op']}"
+                )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run self-contained Agendo ESP32 demo scenario")
     parser.add_argument(
@@ -118,8 +161,7 @@ def main() -> None:
         )
         print("Follow-up skipped?", followup["skipped"])
         print("Follow-up reasoning plan:", followup["reasoning_plan"])
-        if not followup["skipped"] or followup["action"] is not None:
-            raise RuntimeError("Agent failed to skip re-applying reverted action after REVERT NOTICE")
+        assert_followup_does_not_reapply(action_id, followup)
 
 
 if __name__ == "__main__":
