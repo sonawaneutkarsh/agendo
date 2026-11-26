@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Sequence
 
 import psycopg
+from psycopg.rows import dict_row
 import sqlparse
 from sqlparse import tokens as T
 from sqlparse.sql import Identifier, TokenList
@@ -186,55 +187,56 @@ def execute_write(
 
     def _run(c: psycopg.Connection) -> dict[str, Any]:
         with c.transaction():
-            existing = c.execute(
-                """
-                SELECT agent_name, status
-                FROM agendo_actions
-                WHERE action_id = %s::uuid
-                FOR UPDATE
-                """,
-                (resolved_action_id,),
-            ).fetchone()
-
-            if existing is not None:
-                if not allow_append:
-                    raise ActionIdCollisionError(
-                        f"action_id {resolved_action_id} already exists (status={existing['status']}). "
-                        "Use a fresh action_id or pass allow_append=True."
-                    )
-                if existing["status"] != "applied":
-                    raise ActionIdCollisionError(
-                        f"Cannot append to action_id {resolved_action_id} with status '{existing['status']}'."
-                    )
-                if existing["agent_name"] != agent_name:
-                    raise ActionIdCollisionError(
-                        f"action_id {resolved_action_id} belongs to agent '{existing['agent_name']}', "
-                        f"not '{agent_name}'."
-                    )
-            else:
-                c.execute(
+            with c.cursor(row_factory=dict_row) as cur:
+                existing = cur.execute(
                     """
-                    INSERT INTO agendo_actions (action_id, agent_name, description, status)
-                    VALUES (%s::uuid, %s, %s, 'applied')
+                    SELECT agent_name, status
+                    FROM agendo_actions
+                    WHERE action_id = %s::uuid
+                    FOR UPDATE
                     """,
-                    (resolved_action_id, agent_name, description),
+                    (resolved_action_id,),
+                ).fetchone()
+
+                if existing is not None:
+                    if not allow_append:
+                        raise ActionIdCollisionError(
+                            f"action_id {resolved_action_id} already exists (status={existing['status']}). "
+                            "Use a fresh action_id or pass allow_append=True."
+                        )
+                    if existing["status"] != "applied":
+                        raise ActionIdCollisionError(
+                            f"Cannot append to action_id {resolved_action_id} with status '{existing['status']}'."
+                        )
+                    if existing["agent_name"] != agent_name:
+                        raise ActionIdCollisionError(
+                            f"action_id {resolved_action_id} belongs to agent '{existing['agent_name']}', "
+                            f"not '{agent_name}'."
+                        )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO agendo_actions (action_id, agent_name, description, status)
+                        VALUES (%s::uuid, %s, %s, 'applied')
+                        """,
+                        (resolved_action_id, agent_name, description),
+                    )
+
+                # SET LOCAL scopes agendo.action_id strictly to this transaction
+                cur.execute(
+                    "SELECT set_config('agendo.action_id', %s, true)",
+                    (resolved_action_id,),
                 )
+                rowcounts: list[int] = []
+                for stmt, p in statements:
+                    cur.execute(stmt, p)
+                    rowcounts.append(cur.rowcount)
 
-            # SET LOCAL scopes agendo.action_id strictly to this transaction
-            c.execute(
-                "SELECT set_config('agendo.action_id', %s, true)",
-                (resolved_action_id,),
-            )
-            rowcounts: list[int] = []
-            for stmt, p in statements:
-                cur = c.execute(stmt, p)
-                rowcounts.append(cur.rowcount)
-
-            diff_count_row = c.execute(
-                "SELECT COUNT(*)::int AS cnt FROM agendo_row_diffs WHERE action_id = %s::uuid",
-                (resolved_action_id,),
-            ).fetchone()
-            diff_count = diff_count_row["cnt"] if diff_count_row else 0
+                diff_count_row = cur.execute(
+                    "SELECT COUNT(*)::int AS cnt FROM agendo_row_diffs WHERE action_id = %s::uuid",
+                    (resolved_action_id,),
+                ).fetchone()
+                diff_count = diff_count_row["cnt"] if diff_count_row else 0
 
         return {
             "action_id": resolved_action_id,

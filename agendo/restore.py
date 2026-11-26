@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 import psycopg
 from psycopg import sql
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from agendo.db import get_connection
@@ -94,27 +95,29 @@ def _fetch_current_row(
         sql.Identifier(table_name),
         where_sql,
     )
-    row = conn.execute(query, where_vals).fetchone()
+    with conn.cursor(row_factory=dict_row) as cur:
+        row = cur.execute(query, where_vals).fetchone()
     return row["row_json"] if row else None
 
 
 def _get_writable_columns(conn: psycopg.Connection, table_name: str) -> list[str]:
     """Return live non-dropped, non-generated column names for schema-safe DELETE undo."""
-    rows = conn.execute(
-        """
-        SELECT a.attname
-        FROM pg_attribute a
-        JOIN pg_class cl ON cl.oid = a.attrelid
-        JOIN pg_namespace ns ON ns.oid = cl.relnamespace
-        WHERE ns.nspname = ANY(current_schemas(false))
-          AND cl.relname = %s
-          AND a.attnum > 0
-          AND NOT a.attisdropped
-          AND a.attgenerated = ''
-        ORDER BY a.attnum
-        """,
-        (table_name,),
-    ).fetchall()
+    with conn.cursor(row_factory=dict_row) as cur:
+        rows = cur.execute(
+            """
+            SELECT a.attname
+            FROM pg_attribute a
+            JOIN pg_class cl ON cl.oid = a.attrelid
+            JOIN pg_namespace ns ON ns.oid = cl.relnamespace
+            WHERE ns.nspname = ANY(current_schemas(false))
+              AND cl.relname = %s
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND a.attgenerated = ''
+            ORDER BY a.attnum
+            """,
+            (table_name,),
+        ).fetchall()
     return [r["attname"] for r in rows]
 
 
@@ -146,42 +149,43 @@ def restore_action(
     t0 = time.perf_counter()
 
     def _run(c: psycopg.Connection) -> dict[str, Any]:
-        action = c.execute(
-            """
-            SELECT action_id::text AS action_id, agent_name, description, status
-            FROM agendo_actions
-            WHERE action_id = %s::uuid
-            """,
-            (action_id,),
-        ).fetchone()
-        if action is None:
-            raise ActionNotFoundError(f"Action {action_id} not found")
-
-        # Idempotency: second undo is a clean no-op
-        if action["status"] == "reverted":
-            return {
-                "status": "already_reverted",
-                "action_id": action_id,
-                "restored_rows": [],
-                "revert_notice": f"REVERT NOTICE: Action {action_id} was already reverted.",
-                "hook_results": [],
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
-            }
-
-        # Reverse chronological seq order ensures FK-safe undo:
-        # - DELETE undo restores parent rows before child rows
-        # - INSERT undo deletes child rows before parent rows
-        diffs = list(
-            c.execute(
+        with c.cursor(row_factory=dict_row) as cur:
+            action = cur.execute(
                 """
-                SELECT id, seq, table_name, pk, op, old_row, new_row
-                FROM agendo_row_diffs
+                SELECT action_id::text AS action_id, agent_name, description, status
+                FROM agendo_actions
                 WHERE action_id = %s::uuid
-                ORDER BY seq DESC
                 """,
                 (action_id,),
-            ).fetchall()
-        )
+            ).fetchone()
+            if action is None:
+                raise ActionNotFoundError(f"Action {action_id} not found")
+
+            # Idempotency: second undo is a clean no-op
+            if action["status"] == "reverted":
+                return {
+                    "status": "already_reverted",
+                    "action_id": action_id,
+                    "restored_rows": [],
+                    "revert_notice": f"REVERT NOTICE: Action {action_id} was already reverted.",
+                    "hook_results": [],
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
+                }
+
+            # Reverse chronological seq order ensures FK-safe undo:
+            # - DELETE undo restores parent rows before child rows
+            # - INSERT undo deletes child rows before parent rows
+            diffs = list(
+                cur.execute(
+                    """
+                    SELECT id, seq, table_name, pk, op, old_row, new_row
+                    FROM agendo_row_diffs
+                    WHERE action_id = %s::uuid
+                    ORDER BY seq DESC
+                    """,
+                    (action_id,),
+                ).fetchall()
+            )
 
         restored_rows: list[dict[str, Any]] = []
         hook_results: list[Any] = []

@@ -39,7 +39,7 @@ def get_database_url() -> str:
     if not password:
         raise RuntimeError(
             "DATABASE_URL (or POSTGRES_PASSWORD) is not set. "
-            "Copy .env.example to .env or export DATABASE_URL."
+            "Export DATABASE_URL or define it in a .env file."
         )
     user = os.environ.get("POSTGRES_USER", "agendo")
     db = os.environ.get("POSTGRES_DB", "agendo")

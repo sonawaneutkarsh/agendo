@@ -1,6 +1,13 @@
 """Agendo: deterministic row-level rollback engine for AI agents on Postgres."""
 
-from agendo.capture import attach_trigger, get_action_detail, list_actions, table_row_hash
+from agendo.capture import (
+    attach_trigger,
+    get_action_detail,
+    install_schema,
+    list_actions,
+    table_row_hash,
+)
+from agendo.db import get_connection
 from agendo.proxy import ActionIdCollisionError, PermissionDeniedError, execute_write
 from agendo.restore import (
     ActionNotFoundError,
@@ -19,6 +26,8 @@ __all__ = [
     "clear_post_restore_hooks",
     "execute_write",
     "get_action_detail",
+    "get_connection",
+    "install_schema",
     "list_actions",
     "register_post_restore_hook",
     "restore_action",

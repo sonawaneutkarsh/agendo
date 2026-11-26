@@ -33,5 +33,8 @@ Repository = "https://github.com/sonawaneutkarsh/agendo"
 [tool.hatch.build.targets.wheel]
 packages = ["agendo"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"sql/01_agendo.sql" = "agendo/sql/01_agendo.sql"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

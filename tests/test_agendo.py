@@ -582,3 +582,48 @@ def test_step3_followup_diff_check_detects_reapplied_writes_only():
     )
     with pytest.raises(RuntimeError, match="re-applied a reverted statement"):
         assert_followup_does_not_reapply(reverted_id, {"skipped": False, "action": reapply_action})
+
+
+def test_install_schema_and_plain_psycopg_connection():
+    """install_schema() installs Agendo from scratch (idempotently) and works with plain psycopg connections."""
+    import psycopg
+    import agendo
+    from agendo.db import get_database_url
+
+    with psycopg.connect(get_database_url(), autocommit=True) as plain_conn:
+        plain_conn.execute(
+            """
+            DROP TABLE IF EXISTS custom_orders CASCADE;
+            DROP TABLE IF EXISTS agendo_hardware_pushes, diag_logs, calibration, pin_configs, esp32_devices CASCADE;
+            DROP TABLE IF EXISTS agendo_row_diffs, agendo_actions CASCADE;
+            DROP SEQUENCE IF EXISTS agendo_diff_seq CASCADE;
+            DROP FUNCTION IF EXISTS attach_agendo_trigger(REGCLASS);
+            DROP FUNCTION IF EXISTS agendo_capture();
+            """
+        )
+
+        # Calling twice verifies idempotency on a completely fresh database
+        agendo.install_schema(conn=plain_conn)
+        agendo.install_schema(conn=plain_conn)
+
+        plain_conn.execute(
+            "CREATE TABLE custom_orders (order_id INT PRIMARY KEY, total_cents INT NOT NULL)"
+        )
+        agendo.attach_trigger("custom_orders", conn=plain_conn)
+        plain_conn.execute(
+            "INSERT INTO custom_orders (order_id, total_cents) VALUES (1, 4900)"
+        )
+        before = agendo.table_row_hash("custom_orders", "order_id", plain_conn)
+
+        res = agendo.execute_write(
+            sql="UPDATE custom_orders SET total_cents = %s WHERE order_id = %s",
+            params=(0, 1),
+            agent_name="plain-conn-agent",
+            description="Zero order 1",
+            conn=plain_conn,
+        )
+        assert agendo.table_row_hash("custom_orders", "order_id", plain_conn) != before
+
+        undo_res = agendo.restore_action(res["action_id"], conn=plain_conn)
+        assert undo_res["status"] == "reverted"
+        assert agendo.table_row_hash("custom_orders", "order_id", plain_conn) == before
